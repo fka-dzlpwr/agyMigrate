@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#
+# agy-migrate: Launcher wrapper for Antigravity cross-MacBook migration tool
+#
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_EXEC=""
+
+# Find a suitable python3 executable (macOS default or brew)
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_EXEC="python3"
+elif [ -x "/usr/bin/python3" ]; then
+    PYTHON_EXEC="/usr/bin/python3"
+elif [ -x "/opt/homebrew/bin/python3" ]; then
+    PYTHON_EXEC="/opt/homebrew/bin/python3"
+elif [ -x "/usr/local/bin/python3" ]; then
+    PYTHON_EXEC="/usr/local/bin/python3"
+else
+    echo -e "\033[91m[ERROR]\033[0m Python 3 is required to run agy-migrate but was not found." >&2
+    exit 1
+fi
+
+exec "$PYTHON_EXEC" "$SCRIPT_DIR/agy_migrate.py" "$@"
