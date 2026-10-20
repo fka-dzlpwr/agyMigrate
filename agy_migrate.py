@@ -11,13 +11,16 @@ License: Apache 2.0
 """
 
 import argparse
+import getpass
 import glob
 import hashlib
 import json
 import os
 import platform
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -27,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 # Version info
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MANIFEST_VERSION = "1.0"
 
 # ANSI Colors for Terminal Output
@@ -68,8 +71,6 @@ EXCLUDED_DIR_NAMES = {
     "ShaderCache",
     "Crashpad",
     "blob_storage",
-    "tmp",
-    "temp",
     ".DS_Store",
 }
 
@@ -80,7 +81,13 @@ EXCLUDED_EXTENSIONS = {
 }
 
 def should_exclude(path_str: str) -> bool:
-    """Determine whether a file or directory path should be excluded from the archive."""
+    """
+    Determine whether a file or directory path should be excluded from the archive.
+
+    Callers should pass a path *relative to the component being packed* so that
+    unrelated parent directories (e.g. a home folder living under ``/tmp``) never
+    cause a false positive.
+    """
     parts = Path(path_str).parts
     for p in parts:
         if p in EXCLUDED_DIR_NAMES:
@@ -100,62 +107,153 @@ def calculate_sha256(filepath: str) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def get_running_processes() -> List[str]:
-    """Check for active Antigravity processes that might lock databases."""
-    active = []
-    targets = ["Antigravity", "Antigravity IDE", "agy", "language_server"]
-    for t in targets:
-        try:
-            res = subprocess.run(
-                ["pgrep", "-f", t],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            if res.returncode == 0 and res.stdout.strip():
-                pids = res.stdout.strip().splitlines()
-                my_pid = str(os.getpid())
-                if any(p != my_pid for p in pids):
-                    active.append(t)
-        except Exception:
-            pass
-    return list(set(active))
+def verify_checksum(archive_path: str) -> Optional[bool]:
+    """
+    Verify an archive against the ``<archive>.sha256`` file written by export.
+
+    Returns True/False for match/mismatch, or None when no checksum file exists.
+    """
+    checksum_file = f"{archive_path}.sha256"
+    if not os.path.isfile(checksum_file):
+        return None
+    try:
+        with open(checksum_file, "r") as f:
+            expected = f.read().split()[0].strip().lower()
+    except (OSError, IndexError):
+        return False
+    return calculate_sha256(archive_path) == expected
+
+def read_manifest(archive_path: str) -> Dict:
+    """
+    Read ``manifest.json`` from a migration archive.
+
+    The manifest is always the first member, so only the first tar header is read
+    (avoids decompressing a multi-GB archive just to inspect it).
+    """
+    with tarfile.open(archive_path, "r:*") as tar:
+        first = tar.next()
+        if first is None or first.name != "manifest.json":
+            raise ValueError("archive does not start with manifest.json (not an agy-migrate bundle)")
+        f = tar.extractfile(first)
+        if f is None:
+            raise ValueError("could not read manifest.json from archive")
+        return json.loads(f.read().decode("utf-8"))
+
+def safe_extract(tar: tarfile.TarFile, dest: str):
+    """Extract an archive without allowing members to escape ``dest``."""
+    if hasattr(tarfile, "tar_filter"):
+        # Blocks path traversal / absolute member names but keeps symlinks intact.
+        tar.extractall(dest, filter="tar")
+        return
+    dest_real = os.path.realpath(dest)
+    for member in tar.getmembers():
+        target = os.path.realpath(os.path.join(dest, member.name))
+        if os.path.isabs(member.name) or not (target == dest_real or target.startswith(dest_real + os.sep)):
+            raise ValueError(f"unsafe path in archive: {member.name}")
+    tar.extractall(dest)
+
+# Command-line fragments that identify Antigravity processes (matched against `ps` output).
+_APP_PROCESS_MARKERS = [
+    ("Antigravity", "/Antigravity.app/Contents/"),
+    ("Antigravity IDE", "/Antigravity IDE.app/Contents/"),
+]
+
+def get_running_processes() -> List[Tuple[int, str]]:
+    """
+    Check for active Antigravity processes that might lock databases.
+
+    Returns ``(pid, label)`` pairs. This process and all of its ancestors (the
+    shell, terminal, or agent that launched it) are never reported, so the tool
+    can neither detect nor terminate itself.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True, text=True, check=False
+        ).stdout
+    except Exception:
+        return []
+
+    procs: Dict[int, Tuple[int, str]] = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        procs[int(parts[0])] = (int(parts[1]), parts[2])
+
+    protected: Set[int] = set()
+    pid = os.getpid()
+    while pid and pid not in protected:
+        protected.add(pid)
+        pid = procs.get(pid, (0, ""))[0]
+
+    found: List[Tuple[int, str]] = []
+    for pid, (_ppid, cmd) in procs.items():
+        if pid in protected or "agy_migrate" in cmd or "agy-migrate" in cmd:
+            continue
+        label = None
+        for lbl, marker in _APP_PROCESS_MARKERS:
+            if marker in cmd:
+                label = lbl
+                break
+        if label is None and "language_server" in cmd and (".gemini" in cmd or "Antigravity" in cmd):
+            label = "language_server"
+        if label is None and os.path.basename(cmd.split(None, 1)[0]) == "agy":
+            label = "agy"
+        if label:
+            found.append((pid, label))
+    return found
 
 def kill_running_processes(prompt: bool = True, auto_confirm: bool = False) -> bool:
-    """Prompt user or terminate active Antigravity processes safely."""
+    """
+    Prompt user or terminate active Antigravity processes safely.
+
+    Returns True when it is safe to proceed (nothing running, or everything was
+    stopped) and False when the user declined, no confirmation was possible in a
+    non-interactive session, or processes could not be stopped.
+    """
     procs = get_running_processes()
     if not procs:
         return True
-    
-    log_warn(f"Detected running Antigravity processes: {', '.join(procs)}")
-    if prompt and not auto_confirm and sys.stdin.isatty():
-        try:
-            answer = input(f"{Colors.YELLOW}Would you like to gracefully close these processes now? [Y/n]: {Colors.RESET}").strip().lower()
-            if answer not in ("", "y", "yes"):
-                log_warn("Continuing without stopping Antigravity processes.")
-                return True
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return False
-    elif not sys.stdin.isatty() and not auto_confirm:
-        # Running in a non-interactive environment without explicit -y
-        log_info("Non-interactive terminal detected: skipping process termination prompt.")
-        return True
 
-    for p in procs:
-        try:
-            log_info(f"Stopping {p}...")
-            subprocess.run(["pkill", "-TERM", "-f", p], check=False)
-        except Exception as e:
-            log_warn(f"Failed to stop {p}: {e}")
-    time.sleep(1)
-    
-    remaining = get_running_processes()
-    if remaining:
-        log_warn(f"Processes still running ({', '.join(remaining)}), sending KILL signal...")
-        for p in remaining:
-            subprocess.run(["pkill", "-9", "-f", p], check=False)
+    labels = sorted({label for _pid, label in procs})
+    log_warn(f"Detected running Antigravity processes: {', '.join(labels)}")
+    if not auto_confirm:
+        if prompt and sys.stdin.isatty():
+            try:
+                answer = input(f"{Colors.YELLOW}Would you like to gracefully close these processes now? [Y/n]: {Colors.RESET}").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return False
+            if answer not in ("", "y", "yes"):
+                log_error("Cannot proceed safely while Antigravity is running. Quit it and retry.")
+                return False
+        else:
+            log_error("Antigravity is running and no terminal is available to confirm. Quit it, or re-run with --yes to stop it automatically.")
+            return False
+
+    def _signal_all(targets, sig):
+        for pid, label in targets:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError) as e:
+                if not isinstance(e, ProcessLookupError):
+                    log_warn(f"Failed to stop {label} (pid {pid}): {e}")
+
+    log_info("Stopping Antigravity processes...")
+    _signal_all(procs, signal.SIGTERM)
+    for _ in range(10):
         time.sleep(0.5)
+        if not get_running_processes():
+            return True
+
+    remaining = get_running_processes()
+    log_warn("Processes still running, sending KILL signal...")
+    _signal_all(remaining, signal.SIGKILL)
+    time.sleep(0.5)
+    if get_running_processes():
+        log_error("Could not stop all Antigravity processes.")
+        return False
     return True
 
 # ---------------------------------------------------------------------------
@@ -202,13 +300,21 @@ class MigrationPaths:
             os.path.join(self.home, "Applications", "Antigravity IDE.app"),
         ]
         
-        # 7. CLI Launchers & Symlinks
+        # 7. CLI Launchers & Symlinks (user-level only; /usr/local/bin needs root to restore)
         self.cli_launchers = [
             os.path.join(self.home, ".local", "bin", "agy"),
             os.path.join(self.home, ".local", "bin", "antigravity-ide"),
-            "/usr/local/bin/agy",
-            "/usr/local/bin/antigravity-ide",
         ]
+
+    def managed_paths(self) -> List[str]:
+        """Home-relative paths that an import may create or overwrite (used for snapshot/rollback)."""
+        absolute = [
+            self.antigravity_data, self.config_dir, self.skills_dir, self.settings_json,
+            self.state_json, self.gemini_md, self.agents_md, self.cli_dir, self.ide_dir,
+            self.browser_profile, self.installation_id, self.oauth_creds, self.jetski_token,
+            self.app_support_antigravity, self.app_support_ide,
+        ] + self.cli_launchers
+        return [os.path.relpath(p, self.home) for p in absolute]
 
     def get_export_candidates(self, include_apps: bool = True, include_credentials: bool = True) -> List[Tuple[str, str]]:
         """
@@ -261,11 +367,8 @@ class MigrationPaths:
         # CLI Launchers
         for cli_path in self.cli_launchers:
             if os.path.exists(cli_path):
-                if cli_path.startswith(self.home):
-                    rel = os.path.relpath(cli_path, self.home)
-                    candidates.append((cli_path, f"home/{rel}"))
-                else:
-                    candidates.append((cli_path, f"system_bin/{os.path.basename(cli_path)}"))
+                rel = os.path.relpath(cli_path, self.home)
+                candidates.append((cli_path, f"home/{rel}"))
                     
         return candidates
 
@@ -285,23 +388,31 @@ class PathRemapper:
         self.src_arch = src_arch
         self.dst_arch = dst_arch
         
+        # Only match whole path components: /Users/bob must not rewrite /Users/bobby.
+        self._home_re = None
+        if self.src_home and self.dst_home and self.src_home != self.dst_home:
+            self._home_re = re.compile(re.escape(self.src_home) + r"(?![A-Za-z0-9._-])")
+
         self.brew_remap = False
+        self._brew_re = None
         if src_arch in ("x86_64", "i386") and dst_arch in ("arm64", "aarch64"):
             self.old_brew = "/usr/local"
             self.new_brew = "/opt/homebrew"
             self.brew_remap = True
+            # /usr/local also holds non-Homebrew files; only rewrite Homebrew-owned subtrees.
+            self._brew_re = re.compile(r"/usr/local(?=/(?:bin|opt|Cellar|Homebrew)(?![A-Za-z0-9._-]))")
         elif src_arch in ("arm64", "aarch64") and dst_arch in ("x86_64", "i386"):
             self.old_brew = "/opt/homebrew"
             self.new_brew = "/usr/local"
             self.brew_remap = True
+            self._brew_re = re.compile(r"/opt/homebrew(?![A-Za-z0-9._-])")
 
     def remap_string(self, content: str) -> str:
         """Remap home directories and optional brew paths within a text string."""
-        if self.src_home and self.dst_home and self.src_home != self.dst_home:
-            content = content.replace(self.src_home, self.dst_home)
-        if self.brew_remap:
-            content = content.replace(f"{self.old_brew}/bin", f"{self.new_brew}/bin")
-            content = content.replace(self.old_brew, self.new_brew)
+        if self._home_re:
+            content = self._home_re.sub(lambda _m: self.dst_home, content)
+        if self._brew_re:
+            content = self._brew_re.sub(lambda _m: self.new_brew, content)
         return content
 
     def remap_json_obj(self, obj):
@@ -322,14 +433,15 @@ class PathRemapper:
     def remap_file_in_place(self, filepath: str) -> bool:
         """Read file, remap paths, and write back if changes were made."""
         try:
-            if not os.path.isfile(filepath):
+            if not os.path.isfile(filepath) or os.path.islink(filepath):
                 return False
             if filepath.endswith((".json", ".jsonl", ".md", ".txt", ".sh", ".plist", ".yaml", ".yml")):
-                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                # surrogateescape + newline="" round-trips undecodable bytes and line endings unchanged.
+                with open(filepath, "r", encoding="utf-8", errors="surrogateescape", newline="") as f:
                     content = f.read()
                 new_content = self.remap_string(content)
                 if new_content != content:
-                    with open(filepath, "w", encoding="utf-8") as f:
+                    with open(filepath, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
                         f.write(new_content)
                     return True
         except Exception as e:
@@ -340,15 +452,79 @@ class PathRemapper:
 # Core Operations: EXPORT
 # ---------------------------------------------------------------------------
 
+def collect_component(
+    src_path: str, arc_base: str, errors: Optional[List[str]] = None
+) -> Tuple[List[Tuple[str, str]], int, int]:
+    """
+    Walk one export component and return ``(items, file_count, size_bytes)``.
+
+    ``items`` are ``(absolute_path, archive_path)`` pairs added non-recursively, and
+    include directory entries (so empty directories survive) and symlinks
+    (including symlinks to directories, which ``os.walk`` reports as dirs).
+
+    Directories that cannot be listed (e.g. missing macOS privacy permissions) are
+    appended to ``errors`` instead of being silently skipped by ``os.walk``.
+    """
+    items: List[Tuple[str, str]] = []
+    count = 0
+    size = 0
+
+    def _on_error(e: OSError):
+        if errors is not None:
+            errors.append(f"{e.filename or src_path}: {e.strerror or e}")
+
+    if os.path.isdir(src_path):
+        if not os.path.islink(src_path):
+            items.append((src_path, arc_base))
+        for root, dirs, files in os.walk(src_path, onerror=_on_error):
+            kept = []
+            for d in dirs:
+                if should_exclude(d):
+                    continue
+                full_d = os.path.join(root, d)
+                items.append((full_d, os.path.join(arc_base, os.path.relpath(full_d, src_path))))
+                if os.path.islink(full_d):
+                    count += 1  # packed as a symlink; os.walk does not descend into it
+                else:
+                    kept.append(d)
+            dirs[:] = kept
+            for f in files:
+                full_f = os.path.join(root, f)
+                rel = os.path.relpath(full_f, src_path)
+                if should_exclude(rel):
+                    continue
+                items.append((full_f, os.path.join(arc_base, rel)))
+                try:
+                    size += os.lstat(full_f).st_size
+                    count += 1
+                except OSError:
+                    pass
+    elif not should_exclude(os.path.basename(src_path)):
+        # Top-level file components that are symlinks (e.g. ~/.local/bin/agy) are
+        # dereferenced: their target usually lives outside the exported tree and
+        # would dangle on the destination Mac.
+        real = os.path.realpath(src_path) if os.path.islink(src_path) else src_path
+        items.append((real, arc_base))
+        try:
+            size += os.path.getsize(real)
+            count += 1
+        except OSError:
+            pass
+    return items, count, size
+
 def run_export(
     output_path: Optional[str] = None,
     include_apps: bool = False,
     include_credentials: bool = True,
     auto_confirm: bool = False,
-    dry_run: bool = False
+    dry_run: bool = False,
+    ignore_errors: bool = False
 ) -> Optional[str]:
     """
     Exports Antigravity instance, configurations, and conversation history.
+
+    Unreadable directories abort the export (an incomplete bundle must never look
+    successful) unless ``ignore_errors`` is set.
     """
     mode_str = "FULL (+Apps)" if include_apps else "DATA (Configs, History & Settings)"
     log_header(f"Antigravity Migration Export ({mode_str})")
@@ -357,7 +533,8 @@ def run_export(
     
     # 1. Pre-flight check
     if not dry_run:
-        kill_running_processes(prompt=True, auto_confirm=auto_confirm)
+        if not kill_running_processes(prompt=True, auto_confirm=auto_confirm):
+            return None
     
     # 2. Discover files
     candidates = paths.get_export_candidates(
@@ -393,7 +570,7 @@ def run_export(
             "os": platform.system(),
             "mac_ver": platform.mac_ver()[0],
             "arch": platform.machine(),
-            "username": os.getlogin() if hasattr(os, 'getlogin') else os.environ.get("USER", "unknown"),
+            "username": getpass.getuser(),
             "home": paths.home,
         },
         "components": [],
@@ -421,33 +598,11 @@ def run_export(
     print("-" * 60)
     
     filtered_items: List[Tuple[str, str]] = [] # (abs_path, arc_path)
+    walk_errors: List[str] = []
     
     for src_path, arc_base in candidates:
-        component_size = 0
-        component_files = 0
-        
-        if os.path.isfile(src_path):
-            if not should_exclude(src_path):
-                filtered_items.append((src_path, arc_base))
-                size = os.path.getsize(src_path)
-                component_size += size
-                component_files += 1
-        elif os.path.isdir(src_path):
-            for root, dirs, files in os.walk(src_path):
-                dirs[:] = [d for d in dirs if not should_exclude(d)]
-                for f in files:
-                    full_f = os.path.join(root, f)
-                    if not should_exclude(full_f):
-                        rel_in_dir = os.path.relpath(full_f, src_path)
-                        arc_rel = os.path.join(arc_base, rel_in_dir)
-                        filtered_items.append((full_f, arc_rel))
-                        try:
-                            size = os.path.getsize(full_f)
-                            component_size += size
-                            component_files += 1
-                        except OSError:
-                            pass
-                            
+        items, component_files, component_size = collect_component(src_path, arc_base, walk_errors)
+        filtered_items.extend(items)
         total_files += component_files
         total_uncompressed_bytes += component_size
         
@@ -468,6 +623,18 @@ def run_export(
     print(f"{Colors.BOLD}{'Total:':<45} {total_uncompressed_bytes / (1024 * 1024):.2f} MB ({total_files} files){Colors.RESET}")
     print(f"{Colors.CYAN}Conversations to migrate:{Colors.RESET} {manifest['conversations']['count']} sessions\n")
 
+    if walk_errors:
+        for err in walk_errors[:10]:
+            log_error(f"Cannot read {err}")
+        if len(walk_errors) > 10:
+            log_error(f"... and {len(walk_errors) - 10} more unreadable location(s)")
+        log_error("The export would be INCOMPLETE. Grant your terminal Full Disk Access "
+                  "(System Settings > Privacy & Security) or fix permissions, then retry.")
+        if not ignore_errors:
+            log_error("Aborting. Re-run with --ignore-errors to export what is readable anyway.")
+            return None
+        log_warn("--ignore-errors set: continuing with an incomplete export.")
+
     if dry_run:
         log_info(f"[DRY-RUN] Would create archive at: {output_path}")
         return output_path
@@ -481,7 +648,11 @@ def run_export(
             json.dump(manifest, mf, indent=2)
 
         start_t = time.time()
-        with tarfile.open(output_path, "w:gz", compresslevel=6) as tar:
+        skipped = 0
+        # The bundle can contain OAuth tokens and cookies: owner-only permissions from the first byte.
+        fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as raw, tarfile.open(fileobj=raw, mode="w:gz", compresslevel=6) as tar:
             # Add manifest first
             tar.add(manifest_path, arcname="manifest.json")
             
@@ -492,7 +663,13 @@ def run_export(
                 if idx % 500 == 0 or idx == len(filtered_items):
                     pct = (idx / len(filtered_items)) * 100
                     print(f"\rPacking: {pct:5.1f}% [{idx}/{len(filtered_items)} files]", end="", flush=True)
-                tar.add(abs_path, arcname=arc_path, recursive=False)
+                try:
+                    tar.add(abs_path, arcname=arc_path, recursive=False)
+                except OSError as e:
+                    # Live state (databases, sockets) can vanish mid-export.
+                    skipped += 1
+                    print()
+                    log_warn(f"Skipped {abs_path}: {e}")
                 
         print()
         elapsed = time.time() - start_t
@@ -506,12 +683,15 @@ def run_export(
             cf.write(f"{sha256}  {os.path.basename(output_path)}\n")
 
         log_success(f"Archive successfully generated in {elapsed:.1f}s")
+        if skipped:
+            log_warn(f"{skipped} item(s) could not be read and were skipped.")
         log_info(f"Archive Size: {archive_size / (1024 * 1024):.2f} MB")
         log_info(f"SHA-256: {sha256}")
         log_info(f"Checksum file: {checksum_file}")
+        log_warn("The archive contains credentials: transfer it securely and delete it afterwards.")
         
         print(f"\n{Colors.BOLD}{Colors.GREEN}Next Steps to Transfer to New MacBook:{Colors.RESET}")
-        print(f" 1. Transfer {output_path} via AirDrop, Thunderbolt cable, or USB SSD.")
+        print(f" 1. Transfer {output_path} (and its .sha256 file) via AirDrop, Thunderbolt cable, or USB SSD.")
         print(f" 2. On the destination MacBook, run:")
         print(f"    {Colors.CYAN}./agy-migrate import --archive {os.path.basename(output_path)}{Colors.RESET}\n")
         
@@ -537,20 +717,9 @@ def run_inspect(archive_path: str):
     log_info(f"Archive Size: {os.path.getsize(archive_path) / (1024 * 1024):.2f} MB")
 
     try:
-        with tarfile.open(archive_path, "r:*") as tar:
-            try:
-                manifest_member = tar.getmember("manifest.json")
-                f = tar.extractfile(manifest_member)
-                if f:
-                    manifest = json.loads(f.read().decode("utf-8"))
-                else:
-                    log_error("Could not read manifest.json from archive.")
-                    return False
-            except KeyError:
-                log_error("Archive does not contain a valid manifest.json.")
-                return False
+        manifest = read_manifest(archive_path)
     except Exception as e:
-        log_error(f"Failed to open archive: {e}")
+        log_error(f"Failed to read archive: {e}")
         return False
 
     src = manifest.get("source_system", {})
@@ -592,26 +761,39 @@ def run_inspect(archive_path: str):
 def create_snapshot(paths: MigrationPaths) -> Optional[str]:
     """
     Creates an emergency rollback snapshot of the destination machine's current state.
+
+    Every path an import may touch is recorded (including whether it existed), so a
+    rollback can also remove things the import newly created.
     """
     ts = time.strftime("%Y%m%d_%H%M%S")
     snapshot_dir = os.path.join(paths.gemini_dir, f"antigravity-backup-{ts}")
+    suffix = 1
+    while os.path.exists(snapshot_dir):
+        snapshot_dir = os.path.join(paths.gemini_dir, f"antigravity-backup-{ts}-{suffix}")
+        suffix += 1
     log_info(f"Creating safety rollback snapshot at: {snapshot_dir}")
     
     try:
-        os.makedirs(snapshot_dir, exist_ok=True)
-        for item in ["antigravity", "config", "skills", "settings.json", "state.json", "antigravity-cli", "antigravity-ide"]:
-            src = os.path.join(paths.gemini_dir, item)
-            dst = os.path.join(snapshot_dir, item)
-            if os.path.exists(src):
-                if os.path.isdir(src):
-                    shutil.copytree(src, dst, symlinks=True, ignore=lambda d, files: [f for f in files if should_exclude(os.path.join(d, f))])
-                else:
-                    shutil.copy2(src, dst)
+        os.makedirs(snapshot_dir)
+        tracked: Dict[str, bool] = {}
+        for rel in paths.managed_paths():
+            src = os.path.join(paths.home, rel)
+            existed = os.path.lexists(src)
+            tracked[rel] = existed
+            if not existed:
+                continue
+            dst = os.path.join(snapshot_dir, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.isdir(src) and not os.path.islink(src):
+                shutil.copytree(src, dst, symlinks=True, ignore=lambda d, names: [n for n in names if should_exclude(n)])
+            else:
+                shutil.copy2(src, dst, follow_symlinks=False)
                     
         meta = {
             "timestamp": time.time(),
             "date": ts,
-            "paths_backed_up": os.listdir(snapshot_dir)
+            "home": paths.home,
+            "tracked": tracked,
         }
         with open(os.path.join(snapshot_dir, "snapshot_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -649,49 +831,83 @@ def setup_cli_launchers(paths: MigrationPaths):
     target_ide_symlink = os.path.join(local_bin, "antigravity-ide")
     if os.path.exists(ide_app_bin):
         try:
-            if os.path.islink(target_ide_symlink) or os.path.exists(target_ide_symlink):
+            if os.path.islink(target_ide_symlink):
                 os.remove(target_ide_symlink)
-            os.symlink(ide_app_bin, target_ide_symlink)
-            os.chmod(target_ide_symlink, 0o755)
-            log_info(f"Provisioned CLI launcher: {target_ide_symlink} -> {ide_app_bin}")
+            if not os.path.exists(target_ide_symlink):
+                os.symlink(ide_app_bin, target_ide_symlink)
+                log_info(f"Provisioned CLI launcher: {target_ide_symlink} -> {ide_app_bin}")
         except Exception as e:
             log_warn(f"Could not link antigravity-ide: {e}")
 
-    # 2. Check or create `agy` launcher
-    agy_launcher = os.path.join(local_bin, "agy")
-    if not os.path.exists(agy_launcher):
-        content = """#!/usr/bin/env bash
-# Auto-generated agy launcher
-if [ -d "/Applications/Antigravity.app" ]; then
-    open -a "/Applications/Antigravity.app" --args "$@"
-elif [ -d "/Applications/Antigravity IDE.app" ]; then
-    "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity-ide" "$@"
-else
-    echo "Error: Antigravity.app is not found in /Applications" >&2
-    exit 1
-fi
-"""
-        try:
-            with open(agy_launcher, "w") as f:
-                f.write(content)
-            os.chmod(agy_launcher, 0o755)
-            log_info(f"Created agy CLI launcher at: {agy_launcher}")
-        except Exception as e:
-            log_warn(f"Could not create agy launcher: {e}")
+    # 2. The `agy` CLI is a standalone binary restored from the archive; do not fake it.
+    if not os.path.exists(os.path.join(local_bin, "agy")):
+        log_warn("The `agy` CLI binary was not found in ~/.local/bin (it was not on the source Mac, or the archive predates it). Install the Antigravity CLI separately.")
 
-    # 3. Check shell PATH in ~/.zshrc or ~/.bash_profile
+    # 3. Ensure ~/.local/bin is on PATH for zsh (the macOS default shell); a fresh Mac may have no ~/.zshrc yet.
     zshrc = os.path.join(paths.home, ".zshrc")
     path_export = 'export PATH="$HOME/.local/bin:$PATH"'
-    if os.path.exists(zshrc):
-        try:
+    try:
+        lines = ""
+        if os.path.exists(zshrc):
             with open(zshrc, "r") as f:
                 lines = f.read()
-            if ".local/bin" not in lines:
-                with open(zshrc, "a") as f:
-                    f.write(f"\n# Added by agy-migrate\n{path_export}\n")
-                log_info(f"Appended ~/.local/bin to PATH in {zshrc}")
-        except Exception as e:
-            log_warn(f"Could not update {zshrc}: {e}")
+        if ".local/bin" not in lines:
+            with open(zshrc, "a") as f:
+                f.write(f"\n# Added by agy-migrate\n{path_export}\n")
+            log_info(f"Appended ~/.local/bin to PATH in {zshrc}")
+    except Exception as e:
+        log_warn(f"Could not update {zshrc}: {e}")
+
+def _place_symlink(src_link: str, dst_link: str, remapper: Optional[PathRemapper]):
+    """Recreate a symlink at ``dst_link``, remapping an absolute target if needed."""
+    target = os.readlink(src_link)
+    if remapper:
+        target = remapper.remap_string(target)
+    if os.path.islink(dst_link) or os.path.isfile(dst_link):
+        os.remove(dst_link)
+    elif os.path.isdir(dst_link):
+        shutil.rmtree(dst_link)
+    os.symlink(target, dst_link)
+
+def deploy_tree(src_root: str, dst_root: str, remapper: Optional[PathRemapper]) -> int:
+    """
+    Copy an extracted tree into ``dst_root`` preserving symlinks, and remap text files.
+
+    Returns the number of entries that failed to deploy.
+    """
+    errors = 0
+    for root, dirs, files in os.walk(src_root):
+        rel = os.path.relpath(root, src_root)
+        target_root = dst_root if rel == "." else os.path.join(dst_root, rel)
+        os.makedirs(target_root, exist_ok=True)
+
+        for name in list(dirs):
+            src_entry = os.path.join(root, name)
+            if os.path.islink(src_entry):
+                dirs.remove(name)  # symlinks to directories are recreated, never followed
+                try:
+                    _place_symlink(src_entry, os.path.join(target_root, name), remapper)
+                except OSError as e:
+                    errors += 1
+                    log_warn(f"Could not restore symlink {src_entry}: {e}")
+
+        for name in files:
+            src_file = os.path.join(root, name)
+            dst_file = os.path.join(target_root, name)
+            try:
+                if os.path.islink(src_file):
+                    _place_symlink(src_file, dst_file, remapper)
+                    continue
+                # Never write through an existing symlink at the destination.
+                if os.path.islink(dst_file):
+                    os.remove(dst_file)
+                shutil.copy2(src_file, dst_file)
+                if remapper:
+                    remapper.remap_file_in_place(dst_file)
+            except OSError as e:
+                errors += 1
+                log_warn(f"Could not restore {dst_file}: {e}")
+    return errors
 
 def run_import(
     archive_path: str,
@@ -712,15 +928,20 @@ def run_import(
     log_info(f"Restoring from: {archive_path}")
     
     paths = MigrationPaths()
+
+    # 0. Integrity check
+    checksum_ok = verify_checksum(archive_path)
+    if checksum_ok is False:
+        log_error("SHA-256 mismatch: the archive is corrupted or was modified in transit. Re-transfer it.")
+        return False
+    elif checksum_ok is None:
+        log_warn("No .sha256 file next to the archive; skipping integrity check.")
+    else:
+        log_success("Archive SHA-256 verified.")
     
     # 1. Inspect manifest
     try:
-        with tarfile.open(archive_path, "r:*") as tar:
-            f = tar.extractfile(tar.getmember("manifest.json"))
-            if not f:
-                log_error("Invalid archive: missing manifest.json")
-                return False
-            manifest = json.loads(f.read().decode("utf-8"))
+        manifest = read_manifest(archive_path)
     except Exception as e:
         log_error(f"Failed to read archive manifest: {e}")
         return False
@@ -747,27 +968,29 @@ def run_import(
         except Exception:
             pass
 
-    # 2. Stop running processes
-    if not dry_run:
-        if not kill_running_processes(prompt=True, auto_confirm=auto_confirm):
-            return False
-
-    # 3. Create rollback safety snapshot
-    if not skip_snapshot and not dry_run:
-        create_snapshot(paths)
-
     if dry_run:
         log_info(f"[DRY-RUN] Would extract and remap components from {archive_path}")
         return True
+
+    # 2. Stop running processes
+    if not kill_running_processes(prompt=True, auto_confirm=auto_confirm):
+        return False
+
+    # 3. Create rollback safety snapshot
+    if not skip_snapshot:
+        if create_snapshot(paths) is None:
+            log_error("Aborting: no safety snapshot could be created. Fix the problem above or re-run with --skip-snapshot.")
+            return False
 
     # 4. Extract archive
     temp_extract = tempfile.mkdtemp(prefix="agy_import_")
     try:
         log_info("Unpacking migration payload...")
         with tarfile.open(archive_path, "r:*") as tar:
-            tar.extractall(temp_extract)
+            safe_extract(tar, temp_extract)
 
-        remapper = PathRemapper(src_home, dst_home, src_arch, dst_arch)
+        remapper = PathRemapper(src_home, dst_home, src_arch, dst_arch) if remap_paths else None
+        errors = 0
         
         # 5. Move files into destination and perform remapping
         log_info("Deploying components to system and applying path translation...")
@@ -775,20 +998,10 @@ def run_import(
         # Deploy "home/" files
         src_home_dir = os.path.join(temp_extract, "home")
         if os.path.exists(src_home_dir):
-            for root, dirs, files in os.walk(src_home_dir):
-                rel = os.path.relpath(root, src_home_dir)
-                target_root = paths.home if rel == "." else os.path.join(paths.home, rel)
-                os.makedirs(target_root, exist_ok=True)
-                
-                for f in files:
-                    src_file = os.path.join(root, f)
-                    dst_file = os.path.join(target_root, f)
-                    shutil.copy2(src_file, dst_file)
-                    
-                    if remap_paths:
-                        remapper.remap_file_in_place(dst_file)
+            errors += deploy_tree(src_home_dir, paths.home, remapper)
 
         # Deploy "apps/" to /Applications
+        deployed_apps: List[str] = []
         src_apps_dir = os.path.join(temp_extract, "apps")
         if os.path.exists(src_apps_dir):
             for app_name in os.listdir(src_apps_dir):
@@ -803,14 +1016,14 @@ def run_import(
                         shutil.move(dst_app, f"{dst_app}.old_{int(time.time())}")
                 try:
                     shutil.copytree(src_app, dst_app, symlinks=True)
-                    clear_quarantine(dst_app)
+                    deployed_apps.append(dst_app)
                 except Exception as e:
                     log_warn(f"Permission denied copying to /Applications: {e}. Placing into ~/Applications.")
                     user_apps = os.path.join(paths.home, "Applications")
                     os.makedirs(user_apps, exist_ok=True)
                     user_dst_app = os.path.join(user_apps, app_name)
                     shutil.copytree(src_app, user_dst_app, symlinks=True)
-                    clear_quarantine(user_dst_app)
+                    deployed_apps.append(user_dst_app)
 
         # 6. Post-install fixes: permissions, quarantine, and executables
         log_info("Configuring permissions and clearing macOS quarantine flags...")
@@ -828,29 +1041,31 @@ def run_import(
         clear_quarantine(paths.app_support_antigravity)
         clear_quarantine(paths.app_support_ide)
 
-        for app in paths.apps:
-            if os.path.exists(app):
-                for root, dirs, files in os.walk(app):
-                    for f in files:
-                        if f in ("language_server", "sandbox-wrapper.sh", "antigravity-ide", "Antigravity"):
-                            full_bin = os.path.join(root, f)
-                            try:
-                                os.chmod(full_bin, 0o755)
-                                clear_quarantine(full_bin)
-                            except Exception:
-                                pass
+        # Only touch app bundles that this import actually installed.
+        for app in deployed_apps:
+            clear_quarantine(app)
+            for root, dirs, files in os.walk(app):
+                for f in files:
+                    if f in ("language_server", "sandbox-wrapper.sh", "antigravity-ide", "Antigravity"):
+                        try:
+                            os.chmod(os.path.join(root, f), 0o755)
+                        except Exception:
+                            pass
 
         # 7. Setup CLI launchers and shell PATH
         setup_cli_launchers(paths)
 
-        log_success("Restore and configuration finished successfully!")
+        if errors:
+            log_warn(f"Restore finished with {errors} error(s); see warnings above.")
+        else:
+            log_success("Restore and configuration finished successfully!")
         print(f"\n{Colors.BOLD}{Colors.GREEN}Restored Summary:{Colors.RESET}")
         print(f"  Conversations:    {manifest.get('conversations', {}).get('count', 0)} sessions")
         print(f"  Target Home:      {paths.home}")
         print(f"  Brain Location:   {paths.brain_dir}")
         print(f"  Customizations:   {paths.config_dir}")
         print(f"\n{Colors.CYAN}Run `./agy-migrate doctor` to verify system health.{Colors.RESET}\n")
-        return True
+        return errors == 0
     finally:
         shutil.rmtree(temp_extract, ignore_errors=True)
 
@@ -865,7 +1080,7 @@ def run_rollback(snapshot_dir: Optional[str] = None, auto_confirm: bool = False)
     paths = MigrationPaths()
     if not snapshot_dir:
         pattern = os.path.join(paths.gemini_dir, "antigravity-backup-*")
-        snapshots = sorted(glob.glob(pattern))
+        snapshots = sorted(glob.glob(pattern), key=os.path.getmtime)
         if not snapshots:
             log_error(f"No safety snapshots found in {paths.gemini_dir}")
             return False
@@ -876,27 +1091,36 @@ def run_rollback(snapshot_dir: Optional[str] = None, auto_confirm: bool = False)
         log_error(f"Snapshot directory not found: {snapshot_dir}")
         return False
 
+    try:
+        with open(os.path.join(snapshot_dir, "snapshot_meta.json"), "r") as f:
+            tracked = json.load(f).get("tracked")
+    except (OSError, ValueError):
+        tracked = None
+    if not isinstance(tracked, dict):
+        log_error(f"{snapshot_dir} is not a valid agy-migrate snapshot (missing or unreadable snapshot_meta.json).")
+        return False
+
     log_header("Rolling Back Antigravity State")
     log_info(f"Restoring from snapshot: {snapshot_dir}")
     
-    kill_running_processes(prompt=True, auto_confirm=auto_confirm)
+    if not kill_running_processes(prompt=True, auto_confirm=auto_confirm):
+        return False
     
     try:
-        for item in os.listdir(snapshot_dir):
-            if item == "snapshot_meta.json":
-                continue
-            src = os.path.join(snapshot_dir, item)
-            dst = os.path.join(paths.gemini_dir, item)
-            log_info(f"Reverting {dst}...")
-            if os.path.exists(dst):
-                if os.path.isdir(dst):
-                    shutil.rmtree(dst)
+        for rel, existed in tracked.items():
+            dst = os.path.join(paths.home, rel)
+            src = os.path.join(snapshot_dir, rel)
+            log_info(f"Reverting ~/{rel}...")
+            if os.path.islink(dst) or os.path.isfile(dst):
+                os.remove(dst)
+            elif os.path.isdir(dst):
+                shutil.rmtree(dst)
+            if existed:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.isdir(src) and not os.path.islink(src):
+                    shutil.copytree(src, dst, symlinks=True)
                 else:
-                    os.remove(dst)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, symlinks=True)
-            else:
-                shutil.copy2(src, dst)
+                    shutil.copy2(src, dst, follow_symlinks=False)
                 
         log_success("Rollback completed successfully.")
         return True
@@ -915,19 +1139,20 @@ def run_doctor() -> bool:
     log_header("Antigravity System Health & Doctor")
     paths = MigrationPaths()
     
-    checks_passed = 0
     checks_total = 0
+    failures = 0
+    warnings = 0
     
     def check(name: str, passed: bool, details: str, warn_only: bool = False):
-        nonlocal checks_passed, checks_total
+        nonlocal checks_total, failures, warnings
         checks_total += 1
         if passed:
-            checks_passed += 1
             status = f"{Colors.GREEN}[OK]{Colors.RESET}"
         elif warn_only:
-            checks_passed += 1
+            warnings += 1
             status = f"{Colors.YELLOW}[WARN]{Colors.RESET}"
         else:
+            failures += 1
             status = f"{Colors.RED}[FAIL]{Colors.RESET}"
         print(f"  {status} {Colors.BOLD}{name:<32}{Colors.RESET} {details}")
 
@@ -935,12 +1160,21 @@ def run_doctor() -> bool:
     app_exists = any(os.path.exists(a) for a in paths.apps)
     check("Desktop Apps (/Applications)", app_exists, "Antigravity.app or Antigravity IDE.app found" if app_exists else "Apps missing from /Applications")
     
-    agy_on_path = shutil.which("agy") is not None
-    local_agy = os.path.exists(os.path.join(paths.home, ".local", "bin", "agy"))
-    check("CLI `agy` on PATH", agy_on_path or local_agy, f"Found ({shutil.which('agy') or local_agy})" if (agy_on_path or local_agy) else "Not in PATH. Ensure ~/.local/bin is in $PATH", warn_only=True)
+    agy_path = shutil.which("agy")
+    local_agy = os.path.join(paths.home, ".local", "bin", "agy")
+    if agy_path:
+        check("CLI `agy` on PATH", True, f"Found ({agy_path})")
+    elif os.path.exists(local_agy):
+        check("CLI `agy` on PATH", False, f"{local_agy} exists but ~/.local/bin is not in $PATH", warn_only=True)
+    else:
+        check("CLI `agy` on PATH", False, "Not installed", warn_only=True)
     
-    ide_cli = shutil.which("antigravity-ide") is not None or os.path.exists(os.path.join(paths.home, ".local", "bin", "antigravity-ide"))
-    check("CLI `antigravity-ide`", ide_cli, "Launcher found" if ide_cli else "Missing launcher", warn_only=True)
+    ide_path = shutil.which("antigravity-ide")
+    local_ide = os.path.join(paths.home, ".local", "bin", "antigravity-ide")
+    if ide_path:
+        check("CLI `antigravity-ide`", True, f"Found ({ide_path})")
+    else:
+        check("CLI `antigravity-ide`", os.path.exists(local_ide), "Launcher found (not on PATH)" if os.path.exists(local_ide) else "Missing launcher", warn_only=True)
 
     print(f"\n{Colors.BOLD}2. Brain & Conversation History:{Colors.RESET}")
     brain_exists = os.path.isdir(paths.brain_dir)
@@ -976,11 +1210,12 @@ def run_doctor() -> bool:
     check("Python 3 (for Python MCPs)", python_on_path, shutil.which("python3") or "Not found", warn_only=False)
 
     print("-" * 68)
-    if checks_passed >= checks_total - 2:
-        log_success(f"System audit passed ({checks_passed}/{checks_total} checks). Antigravity is ready to run!")
+    summary = f"{checks_total - failures - warnings}/{checks_total} OK, {warnings} warning(s), {failures} failure(s)"
+    if failures == 0:
+        log_success(f"System audit passed ({summary}). Antigravity is ready to run!")
         return True
     else:
-        log_warn(f"System audit completed with warnings ({checks_passed}/{checks_total} checks).")
+        log_warn(f"System audit found problems ({summary}).")
         return False
 
 # ---------------------------------------------------------------------------
@@ -1005,28 +1240,40 @@ def run_sync(target_host: str, include_apps: bool = False, dry_run: bool = False
         
     log_success("SSH connection verified.")
     
-    temp_archive = tempfile.mktemp(suffix=".tar.gz", prefix="agy_sync_")
+    fd, temp_archive = tempfile.mkstemp(suffix=".tar.gz", prefix="agy_sync_")
+    os.close(fd)
     try:
         bundle = run_export(output_path=temp_archive, include_apps=include_apps, auto_confirm=True, dry_run=dry_run)
-        if not bundle or dry_run:
+        if not bundle:
+            return False
+        if dry_run:
             return True
             
         remote_tmp = f"/tmp/{os.path.basename(bundle)}"
+        remote_script = "/tmp/agy_migrate.py"
         log_info(f"Transferring migration bundle to {target_host}:{remote_tmp}...")
         subprocess.run(["scp", bundle, f"{target_host}:{remote_tmp}"], check=True)
-        
-        remote_script = "/tmp/agy_migrate.py"
+        subprocess.run(["scp", f"{bundle}.sha256", f"{target_host}:{remote_tmp}.sha256"], check=True)
         subprocess.run(["scp", __file__, f"{target_host}:{remote_script}"], check=True)
         
         log_info(f"Executing remote restore on {target_host}...")
-        cmd = f"python3 {remote_script} import --archive {remote_tmp} -y && rm -f {remote_tmp} {remote_script}"
+        q_tmp, q_script = shlex.quote(remote_tmp), shlex.quote(remote_script)
+        # Always clean up the remote files, but report the import's real exit status.
+        cmd = (
+            f"python3 {q_script} import --archive {q_tmp} -y; rc=$?; "
+            f"rm -f {q_tmp} {shlex.quote(remote_tmp + '.sha256')} {q_script}; exit $rc"
+        )
         subprocess.run(["ssh", "-t", target_host, cmd], check=True)
         
         log_success(f"Peer-to-peer sync to {target_host} completed successfully!")
         return True
+    except (subprocess.CalledProcessError, OSError) as e:
+        log_error(f"Sync failed: {e}")
+        return False
     finally:
-        if os.path.exists(temp_archive):
-            os.remove(temp_archive)
+        for leftover in (temp_archive, f"{temp_archive}.sha256"):
+            if os.path.exists(leftover):
+                os.remove(leftover)
 
 # ---------------------------------------------------------------------------
 # CLI Argument Parser & Entry Point
@@ -1072,6 +1319,7 @@ Examples:
     p_export.add_argument("--include-apps", action="store_true", help="Include /Applications/Antigravity*.app bundles (default: False, data-only)")
     p_export.add_argument("--no-credentials", action="store_true", help="Exclude OAuth tokens and credential files")
     p_export.add_argument("-y", "--yes", action="store_true", help="Auto-confirm prompts (non-interactive)")
+    p_export.add_argument("--ignore-errors", action="store_true", help="Export even if some directories are unreadable (incomplete bundle)")
     p_export.add_argument("--dry-run", action="store_true", help="Simulate export without creating archive")
     
     # Import Parser
@@ -1107,15 +1355,16 @@ Examples:
         sys.exit(0)
         
     if args.command == "export":
-        run_export(
+        ok = run_export(
             output_path=args.output,
             include_apps=args.include_apps,
             include_credentials=not args.no_credentials,
             auto_confirm=args.yes,
-            dry_run=args.dry_run
-        )
+            dry_run=args.dry_run,
+            ignore_errors=args.ignore_errors
+        ) is not None
     elif args.command == "import":
-        run_import(
+        ok = run_import(
             archive_path=args.archive,
             skip_snapshot=args.skip_snapshot,
             remap_paths=not args.no_remap,
@@ -1123,13 +1372,18 @@ Examples:
             dry_run=args.dry_run
         )
     elif args.command == "inspect":
-        run_inspect(archive_path=args.archive)
+        ok = run_inspect(archive_path=args.archive)
     elif args.command == "rollback":
-        run_rollback(snapshot_dir=args.snapshot, auto_confirm=args.yes)
+        ok = run_rollback(snapshot_dir=args.snapshot, auto_confirm=args.yes)
     elif args.command == "doctor":
-        run_doctor()
+        ok = run_doctor()
     elif args.command == "sync":
-        run_sync(target_host=args.target, include_apps=args.include_apps, dry_run=args.dry_run)
+        ok = run_sync(target_host=args.target, include_apps=args.include_apps, dry_run=args.dry_run)
+    else:
+        ok = False
+
+    # Propagate failure to the shell so scripts (and `sync`'s remote step) can react.
+    sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":
     main()

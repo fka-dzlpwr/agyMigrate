@@ -12,7 +12,7 @@
 - **Apple Silicon & Intel Homebrew Translation**: Intelligently updates binary search paths in MCP configurations when migrating between architectures (`/usr/local` on Intel vs `/opt/homebrew` on Apple Silicon).
 - **GPU Cache Pruning**: Excludes volatile GPU shader caches (`GPUCache`, `DawnCache`, `Code Cache`) to prevent hardware driver crashes across different Mac display hardware while preserving all persistent databases (`IndexedDB`, `LocalStorage`, sessions).
 - **macOS Gatekeeper Quarantine Clearance**: Automatically strips `com.apple.quarantine` attributes and sets executable permissions on language server binaries.
-- **Automatic CLI Provisioning**: Automatically configures `agy` and `antigravity-ide` launchers in `~/.local/bin/` and updates the shell PATH.
+- **Automatic CLI Provisioning**: Restores the `agy` binary, links `antigravity-ide` to the installed IDE app, and adds `~/.local/bin` to your zsh `PATH` (creating `~/.zshrc` if the new Mac has none).
 - **Zero External Dependencies**: Pure Python 3 standard library implementation. Runs out-of-the-box on any Mac with macOS system Python (`/usr/bin/python3`).
 - **Safety Snapshots & Instant Rollback**: Creates an automated timestamped backup of the target endpoint before applying any changes, allowing one-command rollbacks.
 
@@ -137,6 +137,7 @@ Commands:
                -o, --output PATH     Specify custom output archive path
                --include-apps        Include full /Applications/Antigravity*.app binaries (default: False, data-only)
                --no-credentials      Exclude OAuth credentials and session tokens
+               --ignore-errors       Export even if some directories are unreadable (incomplete bundle)
                -y, --yes             Auto-confirm prompts (non-interactive mode)
                --dry-run             Simulate export without writing archive
 
@@ -165,6 +166,20 @@ Commands:
                --include-apps         Include .app bundles (default: False)
                --dry-run              Simulate sync
 ```
+
+---
+
+## Safety & Known Limitations
+
+- **Integrity**: `export` writes `<archive>.sha256`; `import` verifies it (keep the two files together) and refuses a corrupted archive.
+- **Credentials**: the archive contains OAuth tokens and is created owner-only (`0600`). Transfer it over a trusted channel and delete it afterwards.
+- **Incomplete exports fail loudly**: if a directory can't be read (typically macOS privacy protection on `~/Library` or `~/.gemini`), `export` aborts with exit code 1. Grant your terminal **Full Disk Access** and retry, or pass `--ignore-errors` to accept an incomplete bundle.
+- **Running app**: Antigravity must be closed during `export`/`import`. In a non-interactive session pass `--yes` to stop it automatically.
+- **Exit codes**: every command exits non-zero on failure, so it is safe to script (`sync` relies on this).
+- **Rollback scope**: `rollback` reverts everything under `~/.gemini`, the Antigravity folders in `~/Library/Application Support`, and the `~/.local/bin` launchers, including removing files the import newly created. App bundles installed with `--include-apps` are not rolled back.
+- **Path remapping** only rewrites text files (`.json`, `.jsonl`, `.md`, `.txt`, `.sh`, `.plist`, `.yaml`) and symlink targets. Binary state (protobuf `.pb` conversation files, SQLite databases such as `state.vscdb`) is copied verbatim, so absolute paths inside them keep the source username. This only matters when the username differs between Macs.
+- **Electron secrets**: cookies and tokens stored by the desktop apps are encrypted with a per-Mac key in the login Keychain and will not decrypt on the new Mac, so expect to sign in to those apps again. `oauth_creds.json` is plain JSON and migrates as-is.
+- **`agy` CLI**: it is migrated as a binary copy from `~/.local/bin/agy`. If it isn't present on the source Mac, install the CLI separately on the new one.
 
 ---
 
